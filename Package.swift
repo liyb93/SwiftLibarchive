@@ -165,7 +165,8 @@ let package = Package(
                 .define("HAVE_CONFIG_H"),
                 .define("LIBARCHIVE_STATIC"),
                 .define("PLATFORM_DARWIN"),
-                .define("ARCHIVE_ACL_DARWIN", to: "1")
+                .define("ARCHIVE_ACL_DARWIN", to: "1"),
+                .unsafeFlags(["-w"])  // 忽略所有警告（不推荐）
             ]
         ),
         // C语言包装库target
