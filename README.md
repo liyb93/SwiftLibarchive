@@ -1,6 +1,6 @@
 # SwiftLibarchive
 
-SwiftLibarchive 是一个基于 C 语言库 libarchive 封装实现的 Swift 工具类，提供压缩、解压缩和密码检测功能。
+SwiftLibarchive 是一个基于 C 语言库 [libarchive](https://github.com/libarchive/libarchive) 封装实现的 Swift 工具类，提供压缩、解压缩和密码检测功能。
 
 ## 功能特点
 
