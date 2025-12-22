@@ -149,7 +149,7 @@ public class SwiftLibarchive {
     ///   - completion: 完成回调
     /// - Returns: 任务ID，可用于取消操作
     @discardableResult
-    public func extractAsync(archivePath: String, to destinationPath: String, password: String? = nil, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
+    public func extract(archivePath: String, to destinationPath: String, password: String? = nil, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
         let taskId = createTask()
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -291,7 +291,7 @@ public class SwiftLibarchive {
     ///   - completion: 完成回调
     /// - Returns: 任务ID，可用于取消操作
     @discardableResult
-    public func compressAsync(sourcePath: String, to archivePath: String, format: ArchiveFormat, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
+    public func compress(sourcePath: String, to archivePath: String, format: ArchiveFormat, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
         let taskId = createTask()
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -370,7 +370,73 @@ public class SwiftLibarchive {
         
         return taskId
     }
-    
+
+    @discardableResult
+    public func compress(sourcePath: String, to archivePath: String, format: ArchiveFormat, progress: ProgressCallback? = nil) async throws -> UUID {
+        let taskId = createTask()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UUID, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else {
+                        continuation.resume(throwing: ArchiveError.unknownError("Self is nil"))
+                        return
+                    }
+                    var currentProgress: Float = 0.0
+                    let progressTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+                    progressTimer.setEventHandler { [weak self] in
+                        guard
+                            let self = self,
+                            !self.isTaskCancelled(taskId)
+                        else {
+                            progressTimer.cancel()
+                            return
+                        }
+                        if currentProgress < 0.95 {
+                            currentProgress += 0.05
+                            DispatchQueue.main.async {
+                                progress?(currentProgress)
+                            }
+                        }
+                    }
+                    progressTimer.schedule(deadline: .now(), repeating: .milliseconds(200))
+                    progressTimer.resume()
+                    do {
+                        if self.isTaskCancelled(taskId) {
+                            throw ArchiveError.operationCancelled
+                        }
+                        try self.compress(
+                            sourcePath: sourcePath,
+                            to: archivePath,
+                            format: format
+                        )
+                        if self.isTaskCancelled(taskId) {
+                            throw ArchiveError.operationCancelled
+                        }
+                        progressTimer.cancel()
+                        DispatchQueue.main.async {
+                            progress?(1.0)
+                        }
+                        continuation.resume(returning: taskId)
+                    } catch {
+                        progressTimer.cancel()
+                        if self.isTaskCancelled(taskId) {
+                            continuation.resume(throwing: ArchiveError.operationCancelled)
+                        } else if let archiveError = error as? ArchiveError {
+                            continuation.resume(throwing: archiveError)
+                        } else {
+                            continuation.resume(
+                                throwing: ArchiveError.unknownError(error.localizedDescription)
+                            )
+                        }
+                    }
+                    self.removeTask(taskId)
+                }
+            }
+        } onCancel: {
+            self.cancelTask(taskId)
+        }
+    }
+
     /// 取消压缩任务
     /// - Parameter taskId: 任务ID
     public func cancelCompress(taskId: UUID) {

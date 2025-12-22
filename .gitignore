@@ -56,3 +56,10 @@ dkms.conf
 
 # Swift Package Manager
 .swiftpm
+.build
+xcuserdata/
+Packages
+xcuserdata
+.DS_Store
+*.xcscmblueprint
+*.xccheckout
