@@ -4,6 +4,7 @@
 #include "../libarchive_src/libarchive/archive.h"
 #include "../libarchive_src/libarchive/archive_entry.h"
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -11,17 +12,21 @@
 #include "include/libarchive_wrapper.h"
 
 // 函数声明
-static int copy_data(struct archive *ar, struct archive *aw);
-static int add_directory_to_archive(struct archive *a, const char *dir_path, const char *parent_path);
+static int copy_data(struct archive *ar, struct archive *aw, volatile int *cancel_flag);
+static int add_directory_to_archive(struct archive *a, const char *dir_path, const char *parent_path, volatile int *cancel_flag);
 
 // 复制数据从一个归档到另一个归档
-static int copy_data(struct archive *ar, struct archive *aw) {
+static int copy_data(struct archive *ar, struct archive *aw, volatile int *cancel_flag) {
     int r;
     const void *buff;
     size_t size;
     la_int64_t offset;
     
     for (;;) {
+        if (cancel_flag && *cancel_flag) {
+            fprintf(stderr, "[cancel_flag] copy_data detected cancel (value=%d)\n", *cancel_flag);
+            return ERROR_OPERATION_CANCELLED;
+        }
         r = archive_read_data_block(ar, &buff, &size, &offset);
         if (r == ARCHIVE_EOF)
             return ARCHIVE_OK;
@@ -36,7 +41,7 @@ static int copy_data(struct archive *ar, struct archive *aw) {
 }
 
 // 递归添加目录到归档
-static int add_directory_to_archive(struct archive *a, const char *dir_path, const char *parent_path) {
+static int add_directory_to_archive(struct archive *a, const char *dir_path, const char *parent_path, volatile int *cancel_flag) {
     DIR *dir;
     struct dirent *entry;
     struct stat st;
@@ -51,6 +56,11 @@ static int add_directory_to_archive(struct archive *a, const char *dir_path, con
     }
     
     while ((entry = readdir(dir)) != NULL) {
+        if (cancel_flag && *cancel_flag) {
+            fprintf(stderr, "[cancel_flag] add_directory_to_archive detected cancel (value=%d)\n", *cancel_flag);
+            closedir(dir);
+            return ERROR_OPERATION_CANCELLED;
+        }
         // 跳过 . 和 ..
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
@@ -89,7 +99,7 @@ static int add_directory_to_archive(struct archive *a, const char *dir_path, con
             }
             
             // 递归处理子目录
-            r = add_directory_to_archive(a, full_path, archive_path);
+            r = add_directory_to_archive(a, full_path, archive_path, cancel_flag);
             if (r < ARCHIVE_OK) {
                 closedir(dir);
                 return r;
@@ -143,6 +153,7 @@ static int add_directory_to_archive(struct archive *a, const char *dir_path, con
 #define ERROR_PASSWORD_REQUIRED -6
 #define ERROR_WRONG_PASSWORD -7
 #define ERROR_UNSUPPORTED_FORMAT -8
+#define ERROR_OPERATION_CANCELLED -9
 
 // 加密检测结果
 #define ENCRYPTION_NONE 0
@@ -155,14 +166,23 @@ static int add_directory_to_archive(struct archive *a, const char *dir_path, con
  * @param archive_path 归档文件路径
  * @param destination_path 目标路径
  * @param password 密码（可为NULL）
+ * @param cancel_flag 取消标记指针（可为NULL，为1时中断操作）
  * @return 成功返回SUCCESS，失败返回错误代码
  */
-int extract_archive(const char *archive_path, const char *destination_path, const char *password) {
-    struct archive *a;
-    struct archive *ext;
+int extract_archive(const char *archive_path, const char *destination_path, const char *password, volatile int *cancel_flag) {
+    struct archive *a = NULL;
+    struct archive *ext = NULL;
     struct archive_entry *entry;
     int flags;
     int r;
+    int result = SUCCESS;
+    char current_dir[PATH_MAX];
+    int changed_dir = 0;
+    
+    if (cancel_flag && *cancel_flag) {
+        fprintf(stderr, "[cancel_flag] extract_archive early cancel before start (value=%d)\n", *cancel_flag);
+        return ERROR_OPERATION_CANCELLED;
+    }
     
     // 选择要支持的格式和过滤器
     flags = ARCHIVE_EXTRACT_TIME;
@@ -180,8 +200,8 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
         r = archive_read_add_passphrase(a, password);
         if (r != ARCHIVE_OK) {
             fprintf(stderr, "设置密码失败: %s\n", archive_error_string(a));
-            archive_read_free(a);
-            return ERROR_WRONG_PASSWORD;
+            result = ERROR_WRONG_PASSWORD;
+            goto cleanup;
         }
     }
     
@@ -193,9 +213,8 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
     // 打开归档文件
     if ((r = archive_read_open_filename(a, archive_path, 10240)) != ARCHIVE_OK) {
         fprintf(stderr, "无法打开归档文件: %s\n", archive_error_string(a));
-        archive_read_free(a);
-        archive_write_free(ext);
-        return ERROR_OPEN_FILE_FAILED;
+        result = ERROR_OPEN_FILE_FAILED;
+        goto cleanup;
     }
     
     // 创建目标目录（如果不存在）
@@ -205,23 +224,26 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
     }
     
     // 切换到目标目录
-    char current_dir[PATH_MAX];
     if (getcwd(current_dir, sizeof(current_dir)) == NULL) {
         fprintf(stderr, "获取当前目录失败\n");
-        archive_read_free(a);
-        archive_write_free(ext);
-        return ERROR_EXTRACT_FAILED;
+        result = ERROR_EXTRACT_FAILED;
+        goto cleanup;
     }
     
     if (chdir(destination_path) != 0) {
         fprintf(stderr, "无法切换到目标目录: %s\n", destination_path);
-        archive_read_free(a);
-        archive_write_free(ext);
-        return ERROR_EXTRACT_FAILED;
+        result = ERROR_EXTRACT_FAILED;
+        goto cleanup;
     }
+    changed_dir = 1;
     
     // 解压缩归档
     for (;;) {
+        if (cancel_flag && *cancel_flag) {
+            fprintf(stderr, "[cancel_flag] extract_archive loop detected cancel (value=%d)\n", *cancel_flag);
+            result = ERROR_OPERATION_CANCELLED;
+            goto cleanup;
+        }
         r = archive_read_next_header(a, &entry);
         if (r == ARCHIVE_EOF)
             break;
@@ -235,18 +257,14 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
         if (archive_entry_is_encrypted(entry)) {
             if (password == NULL) {
                 fprintf(stderr, "条目已加密，需要密码\n");
-                chdir(current_dir);
-                archive_read_free(a);
-                archive_write_free(ext);
-                return ERROR_PASSWORD_REQUIRED;
+                result = ERROR_PASSWORD_REQUIRED;
+                goto cleanup;
             }
             // 如果提供了密码但仍然有问题，可能是密码错误
             if (r < ARCHIVE_OK) {
                 fprintf(stderr, "条目已加密，密码可能不正确\n");
-                chdir(current_dir);
-                archive_read_free(a);
-                archive_write_free(ext);
-                return ERROR_WRONG_PASSWORD;
+                result = ERROR_WRONG_PASSWORD;
+                goto cleanup;
             }
         }
         
@@ -254,37 +272,43 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
             fprintf(stderr, "警告: %s\n", archive_error_string(a));
         } else if (r < ARCHIVE_OK) {
             fprintf(stderr, "错误: %s\n", archive_error_string(a));
-            chdir(current_dir);
-            archive_read_free(a);
-            archive_write_free(ext);
-            return ERROR_READ_ENTRY_FAILED;
+            result = ERROR_READ_ENTRY_FAILED;
+            goto cleanup;
         }
         
         r = archive_write_header(ext, entry);
         if (r < ARCHIVE_OK) {
             fprintf(stderr, "%s\n", archive_error_string(ext));
         } else if (archive_entry_size(entry) > 0) {
-            r = copy_data(a, ext);
+            r = copy_data(a, ext, cancel_flag);
+            if (r == ERROR_OPERATION_CANCELLED) {
+                result = ERROR_OPERATION_CANCELLED;
+                goto cleanup;
+            }
             if (r < ARCHIVE_OK) {
                 fprintf(stderr, "%s\n", archive_error_string(ext));
-                chdir(current_dir);
-                archive_read_free(a);
-                archive_write_free(ext);
-                return ERROR_EXTRACT_FAILED;
+                result = ERROR_EXTRACT_FAILED;
+                goto cleanup;
             }
         }
     }
     
-    // 切回原目录
+cleanup:
+    if (changed_dir) {
     chdir(current_dir);
+    }
     
-    // 清理资源
+    if (a != NULL) {
     archive_read_close(a);
     archive_read_free(a);
+    }
+    
+    if (ext != NULL) {
     archive_write_close(ext);
     archive_write_free(ext);
+    }
     
-    return SUCCESS;
+    return result;
 }
 
 /**
@@ -295,15 +319,22 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
  * @param password 密码（可为NULL）
  * @return 成功返回SUCCESS，失败返回错误代码
  */
-int compress_files(const char *source_path, const char *archive_path, int format, const char *password) {
-    struct archive *a;
+int compress_files(const char *source_path, const char *archive_path, int format, const char *password, volatile int *cancel_flag) {
+    struct archive *a = NULL;
     struct stat st;
     int r;
+    int result = SUCCESS;
+    
+    if (cancel_flag && *cancel_flag) {
+        fprintf(stderr, "[cancel_flag] compress_files early cancel before start (value=%d)\n", *cancel_flag);
+        return ERROR_OPERATION_CANCELLED;
+    }
     
     // 检查源路径是否存在
     if (stat(source_path, &st) != 0) {
         fprintf(stderr, "源路径不存在: %s\n", source_path);
-        return ERROR_OPEN_FILE_FAILED;
+        result = ERROR_OPEN_FILE_FAILED;
+        goto cleanup;
     }
     
     // 创建新的归档写入对象
@@ -346,8 +377,8 @@ int compress_files(const char *source_path, const char *archive_path, int format
             break;
         default:
             fprintf(stderr, "不支持的格式: %d\n", format);
-            archive_write_free(a);
-            return ERROR_UNSUPPORTED_FORMAT;
+            result = ERROR_UNSUPPORTED_FORMAT;
+            goto cleanup;
     }
     
     // 如果提供了密码，设置密码（仅对支持加密的格式有效）
@@ -356,8 +387,8 @@ int compress_files(const char *source_path, const char *archive_path, int format
             r = archive_write_set_passphrase(a, password);
             if (r != ARCHIVE_OK) {
                 fprintf(stderr, "设置密码失败: %s\n", archive_error_string(a));
-                archive_write_free(a);
-                return ERROR_COMPRESS_FAILED;
+                result = ERROR_COMPRESS_FAILED;
+                goto cleanup;
             }
             
             // 根据格式启用相应的加密
@@ -365,8 +396,8 @@ int compress_files(const char *source_path, const char *archive_path, int format
                 r = archive_write_set_options(a, "zip:encryption=traditional");
                 if (r != ARCHIVE_OK) {
                     fprintf(stderr, "启用ZIP加密失败: %s\n", archive_error_string(a));
-                    archive_write_free(a);
-                    return ERROR_COMPRESS_FAILED;
+                    result = ERROR_COMPRESS_FAILED;
+                    goto cleanup;
                 }
             }
             // 7Z格式默认支持加密，不需要额外设置
@@ -379,19 +410,18 @@ int compress_files(const char *source_path, const char *archive_path, int format
     r = archive_write_open_filename(a, archive_path);
     if (r != ARCHIVE_OK) {
         fprintf(stderr, "无法创建归档文件: %s\n", archive_error_string(a));
-        archive_write_free(a);
-        return ERROR_CREATE_ARCHIVE_FAILED;
+        result = ERROR_CREATE_ARCHIVE_FAILED;
+        goto cleanup;
     }
     
     // 处理源路径（文件或目录）
     if (S_ISDIR(st.st_mode)) {
         // 处理目录
-        r = add_directory_to_archive(a, source_path, NULL);
+        r = add_directory_to_archive(a, source_path, NULL, cancel_flag);
         if (r < ARCHIVE_OK) {
             fprintf(stderr, "添加目录到归档失败: %s\n", archive_error_string(a));
-            archive_write_close(a);
-            archive_write_free(a);
-            return ERROR_COMPRESS_FAILED;
+            result = (r == ERROR_OPERATION_CANCELLED) ? ERROR_OPERATION_CANCELLED : ERROR_COMPRESS_FAILED;
+            goto cleanup;
         }
     } else if (S_ISREG(st.st_mode)) {
         // 处理单个文件
@@ -416,9 +446,8 @@ int compress_files(const char *source_path, const char *archive_path, int format
         
         if (r < ARCHIVE_OK) {
             fprintf(stderr, "%s\n", archive_error_string(a));
-            archive_write_close(a);
-            archive_write_free(a);
-            return ERROR_COMPRESS_FAILED;
+            result = ERROR_COMPRESS_FAILED;
+            goto cleanup;
         }
         
         // 写入文件内容
@@ -427,27 +456,33 @@ int compress_files(const char *source_path, const char *archive_path, int format
             char buffer[8192];
             size_t bytes_read;
             while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+                if (cancel_flag && *cancel_flag) {
+                    fprintf(stderr, "[cancel_flag] compress_files write loop detected cancel (value=%d)\n", *cancel_flag);
+                    fclose(file);
+                    result = ERROR_OPERATION_CANCELLED;
+                    goto cleanup;
+                }
                 archive_write_data(a, buffer, bytes_read);
             }
             fclose(file);
         } else {
             fprintf(stderr, "无法打开文件: %s\n", source_path);
-            archive_write_close(a);
-            archive_write_free(a);
-            return ERROR_OPEN_FILE_FAILED;
+            result = ERROR_OPEN_FILE_FAILED;
+            goto cleanup;
         }
     } else {
         fprintf(stderr, "不支持的文件类型: %s\n", source_path);
-        archive_write_close(a);
-        archive_write_free(a);
-        return ERROR_UNSUPPORTED_FORMAT;
+        result = ERROR_UNSUPPORTED_FORMAT;
+        goto cleanup;
     }
     
-    // 关闭并释放资源
-    archive_write_close(a);
-    archive_write_free(a);
+cleanup:
+    if (a != NULL) {
+        archive_write_close(a);
+        archive_write_free(a);
+    }
     
-    return SUCCESS;
+    return result;
 }
 
 /**

@@ -10,9 +10,10 @@ extern "C" {
  * @param archive_path 压缩包路径
  * @param destination_path 解压目标路径
  * @param password 解压密码（如果需要）
+ * @param cancel_flag 取消标记指针（可为NULL，为1时中断操作）
  * @return 0表示成功，其他值表示错误代码
  */
-int extract_archive(const char *archive_path, const char *destination_path, const char *password);
+int extract_archive(const char *archive_path, const char *destination_path, const char *password, volatile int *cancel_flag);
 
 /**
  * 压缩文件或目录
@@ -20,9 +21,10 @@ int extract_archive(const char *archive_path, const char *destination_path, cons
  * @param archive_path 目标压缩包路径
  * @param format 压缩格式（1=zip, 2=tar, 3=tar.gz, 4=tar.bz2, 5=tar.xz, 6=7z, 7=bzip2, 8=xz, 9=gzip）
  * @param password 压缩密码（如果需要，仅ZIP和7Z格式支持）
+ * @param cancel_flag 取消标记指针（可为NULL，为1时中断操作）
  * @return 0表示成功，其他值表示错误代码
  */
-int compress_files(const char *source_path, const char *archive_path, int format, const char *password);
+int compress_files(const char *source_path, const char *archive_path, int format, const char *password, volatile int *cancel_flag);
 
 /**
  * 检测压缩包是否需要密码
@@ -48,6 +50,7 @@ int check_archive_format_support(const char *file_path);
 #define ERROR_PASSWORD_REQUIRED -6
 #define ERROR_WRONG_PASSWORD -7
 #define ERROR_UNSUPPORTED_FORMAT -8
+#define ERROR_OPERATION_CANCELLED -9
 
 // 加密检测结果
 #define ENCRYPTION_NONE 0

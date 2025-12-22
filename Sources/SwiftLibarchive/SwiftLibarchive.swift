@@ -75,18 +75,43 @@ public class SwiftLibarchive {
     /// 单例实例
     public static let shared = SwiftLibarchive()
     
+    /// 任务输出类型
+    private enum TaskOutputType {
+        case none
+        case extract
+        case compress
+    }
+    
+    /// 任务状态
+    private struct TaskState {
+        var isCancelled: Bool
+        var cancelFlag: UnsafeMutablePointer<Int32>?
+        var outputPath: String?
+        var outputType: TaskOutputType
+        var createdDestination: Bool
+    }
+    
     /// 活动任务管理
-    private var activeTasks: [UUID: Bool] = [:]
+    private var activeTasks: [UUID: TaskState] = [:]
     private let taskLock = NSLock()
     
     /// 私有初始化方法
     private init() {}
     
     /// 创建新任务ID
-    private func createTask() -> UUID {
+    private func createTask(outputPath: String?, outputType: TaskOutputType, createdDestination: Bool) -> UUID {
         let taskId = UUID()
+        let cancelFlag = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        cancelFlag.initialize(to: 0)
+        
         taskLock.lock()
-        activeTasks[taskId] = false
+        activeTasks[taskId] = TaskState(
+            isCancelled: false,
+            cancelFlag: cancelFlag,
+            outputPath: outputPath,
+            outputType: outputType,
+            createdDestination: createdDestination
+        )
         taskLock.unlock()
         return taskId
     }
@@ -94,7 +119,18 @@ public class SwiftLibarchive {
     /// 标记任务为已取消
     private func cancelTask(_ taskId: UUID) {
         taskLock.lock()
-        activeTasks[taskId] = true
+        if var state = activeTasks[taskId] {
+            state.isCancelled = true
+            state.cancelFlag?.pointee = 1
+            #if DEBUG
+            if let ptr = state.cancelFlag {
+                fputs("[cancel_flag] Swift cancelTask set flag to \(ptr.pointee) for task \(taskId)\n", stderr)
+            } else {
+                fputs("[cancel_flag] Swift cancelTask found nil flag for task \(taskId)\n", stderr)
+            }
+            #endif
+            activeTasks[taskId] = state
+        }
         taskLock.unlock()
     }
     
@@ -102,14 +138,52 @@ public class SwiftLibarchive {
     private func isTaskCancelled(_ taskId: UUID) -> Bool {
         taskLock.lock()
         defer { taskLock.unlock() }
-        return activeTasks[taskId] ?? false
+        return activeTasks[taskId]?.isCancelled ?? false
     }
     
     /// 移除任务
     private func removeTask(_ taskId: UUID) {
         taskLock.lock()
-        activeTasks.removeValue(forKey: taskId)
+        if let state = activeTasks.removeValue(forKey: taskId) {
+            state.cancelFlag?.deinitialize(count: 1)
+            state.cancelFlag?.deallocate()
+        }
         taskLock.unlock()
+    }
+    
+    /// 取消后清理已生成的输出
+    private func cleanupOutputIfNeeded(_ taskId: UUID) {
+        taskLock.lock()
+        guard let state = activeTasks[taskId] else {
+            taskLock.unlock()
+            return
+        }
+        taskLock.unlock()
+        
+        guard let path = state.outputPath else { return }
+        let fm = FileManager.default
+        
+        switch state.outputType {
+        case .none:
+            break
+        case .extract:
+            // 仅在本次操作创建的目录时清理，避免误删用户已有目录
+            if state.createdDestination {
+                try? fm.removeItem(atPath: path)
+            }
+        case .compress:
+            // 删除已生成的压缩包文件
+            if fm.fileExists(atPath: path) {
+                try? fm.removeItem(atPath: path)
+            }
+        }
+    }
+    
+    /// 获取对应任务的取消标记指针
+    private func cancelPointer(for taskId: UUID) -> UnsafeMutablePointer<Int32>? {
+        taskLock.lock()
+        defer { taskLock.unlock() }
+        return activeTasks[taskId]?.cancelFlag
     }
     
     /// 解压缩文件（同步方法）
@@ -118,9 +192,9 @@ public class SwiftLibarchive {
     ///   - destinationPath: 解压目标路径
     ///   - password: 解压密码（如果需要）
     /// - Throws: 解压过程中的错误
-    public func extract(archivePath: String, to destinationPath: String, password: String? = nil) throws {
+    public func extract(archivePath: String, to destinationPath: String, password: String? = nil, cancelFlag: UnsafeMutablePointer<Int32>? = nil) throws {
         // 实现将在C函数中完成
-        let result = extractArchive(archivePath, destinationPath, password)
+        let result = extractArchive(archivePath, destinationPath, password, cancelFlag)
         
         if result != 0 {
             switch result {
@@ -134,6 +208,8 @@ public class SwiftLibarchive {
                 throw ArchiveError.readEntryFailed
             case ERROR_EXTRACT_FAILED:
                 throw ArchiveError.extractFailed
+            case ERROR_OPERATION_CANCELLED:
+                throw ArchiveError.operationCancelled
             default:
                 throw ArchiveError.unknownError("Unknown error code: \(result)")
             }
@@ -150,7 +226,9 @@ public class SwiftLibarchive {
     /// - Returns: 任务ID，可用于取消操作
     @discardableResult
     public func extract(archivePath: String, to destinationPath: String, password: String? = nil, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
-        let taskId = createTask()
+        let destinationExists = FileManager.default.fileExists(atPath: destinationPath)
+        let taskId = createTask(outputPath: destinationPath, outputType: .extract, createdDestination: !destinationExists)
+        let cancelFlag = cancelPointer(for: taskId)
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else {
@@ -187,12 +265,13 @@ public class SwiftLibarchive {
                     DispatchQueue.main.async {
                         completion(.failure(.operationCancelled))
                     }
+                    self.cleanupOutputIfNeeded(taskId)
                     self.removeTask(taskId)
                     return
                 }
                 
                 // 执行解压操作
-                try self.extract(archivePath: archivePath, to: destinationPath, password: password)
+                try self.extract(archivePath: archivePath, to: destinationPath, password: password, cancelFlag: cancelFlag)
                 
                 // 检查任务是否已取消
                 if self.isTaskCancelled(taskId) {
@@ -200,6 +279,7 @@ public class SwiftLibarchive {
                     DispatchQueue.main.async {
                         completion(.failure(.operationCancelled))
                     }
+                    self.cleanupOutputIfNeeded(taskId)
                     self.removeTask(taskId)
                     return
                 }
@@ -215,20 +295,23 @@ public class SwiftLibarchive {
                 DispatchQueue.main.async {
                     if self.isTaskCancelled(taskId) {
                         completion(.failure(.operationCancelled))
+                        self.cleanupOutputIfNeeded(taskId)
                     } else if let archiveError = error as? ArchiveError {
+                        if archiveError == .operationCancelled {
+                            self.cleanupOutputIfNeeded(taskId)
+                        }
                         completion(.failure(archiveError))
                     } else {
                         completion(.failure(.unknownError(error.localizedDescription)))
                     }
                 }
             }
-            
             self.removeTask(taskId)
         }
         
         return taskId
     }
-    
+
     /// 取消解压任务
     /// - Parameter taskId: 任务ID
     public func cancelExtract(taskId: UUID) {
@@ -242,7 +325,7 @@ public class SwiftLibarchive {
     ///   - format: 压缩格式
     ///   - password: 压缩密码（如果需要）
     /// - Throws: 压缩过程中的错误
-    public func compress(sourcePath: String, to archivePath: String, format: ArchiveFormat) throws {
+    public func compress(sourcePath: String, to archivePath: String, format: ArchiveFormat, cancelFlag: UnsafeMutablePointer<Int32>? = nil) throws {
         // 将枚举转换为对应的格式值
         let formatValue: Int32
         var password: String? = nil
@@ -263,7 +346,7 @@ public class SwiftLibarchive {
         }
         
         // 实现将在C函数中完成
-        let result = compressFiles(sourcePath, archivePath, Int32(formatValue), password)
+        let result = compressFiles(sourcePath, archivePath, Int32(formatValue), password, cancelFlag)
         
         if result != 0 {
             switch result {
@@ -275,6 +358,8 @@ public class SwiftLibarchive {
                 throw ArchiveError.compressFailed
             case ERROR_UNSUPPORTED_FORMAT:
                 throw ArchiveError.unsupportedFormat
+            case ERROR_OPERATION_CANCELLED:
+                throw ArchiveError.operationCancelled
             default:
                 throw ArchiveError.unknownError("Unknown error code: \(result)")
             }
@@ -292,7 +377,8 @@ public class SwiftLibarchive {
     /// - Returns: 任务ID，可用于取消操作
     @discardableResult
     public func compress(sourcePath: String, to archivePath: String, format: ArchiveFormat, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
-        let taskId = createTask()
+        let taskId = createTask(outputPath: archivePath, outputType: .compress, createdDestination: true)
+        let cancelFlag = cancelPointer(for: taskId)
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else {
@@ -329,12 +415,13 @@ public class SwiftLibarchive {
                     DispatchQueue.main.async {
                         completion(.failure(.operationCancelled))
                     }
+                    self.cleanupOutputIfNeeded(taskId)
                     self.removeTask(taskId)
                     return
                 }
                 
                 // 执行压缩操作
-                try self.compress(sourcePath: sourcePath, to: archivePath, format: format)
+                try self.compress(sourcePath: sourcePath, to: archivePath, format: format, cancelFlag: cancelFlag)
                 
                 // 检查任务是否已取消
                 if self.isTaskCancelled(taskId) {
@@ -342,6 +429,7 @@ public class SwiftLibarchive {
                     DispatchQueue.main.async {
                         completion(.failure(.operationCancelled))
                     }
+                    self.cleanupOutputIfNeeded(taskId)
                     self.removeTask(taskId)
                     return
                 }
@@ -357,7 +445,11 @@ public class SwiftLibarchive {
                 DispatchQueue.main.async {
                     if self.isTaskCancelled(taskId) {
                         completion(.failure(.operationCancelled))
+                        self.cleanupOutputIfNeeded(taskId)
                     } else if let archiveError = error as? ArchiveError {
+                        if archiveError == .operationCancelled {
+                            self.cleanupOutputIfNeeded(taskId)
+                        }
                         completion(.failure(archiveError))
                     } else {
                         completion(.failure(.unknownError(error.localizedDescription)))
@@ -369,72 +461,6 @@ public class SwiftLibarchive {
         }
         
         return taskId
-    }
-
-    @discardableResult
-    public func compress(sourcePath: String, to archivePath: String, format: ArchiveFormat, progress: ProgressCallback? = nil) async throws -> UUID {
-        let taskId = createTask()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UUID, Error>) in
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self = self else {
-                        continuation.resume(throwing: ArchiveError.unknownError("Self is nil"))
-                        return
-                    }
-                    var currentProgress: Float = 0.0
-                    let progressTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-                    progressTimer.setEventHandler { [weak self] in
-                        guard
-                            let self = self,
-                            !self.isTaskCancelled(taskId)
-                        else {
-                            progressTimer.cancel()
-                            return
-                        }
-                        if currentProgress < 0.95 {
-                            currentProgress += 0.05
-                            DispatchQueue.main.async {
-                                progress?(currentProgress)
-                            }
-                        }
-                    }
-                    progressTimer.schedule(deadline: .now(), repeating: .milliseconds(200))
-                    progressTimer.resume()
-                    do {
-                        if self.isTaskCancelled(taskId) {
-                            throw ArchiveError.operationCancelled
-                        }
-                        try self.compress(
-                            sourcePath: sourcePath,
-                            to: archivePath,
-                            format: format
-                        )
-                        if self.isTaskCancelled(taskId) {
-                            throw ArchiveError.operationCancelled
-                        }
-                        progressTimer.cancel()
-                        DispatchQueue.main.async {
-                            progress?(1.0)
-                        }
-                        continuation.resume(returning: taskId)
-                    } catch {
-                        progressTimer.cancel()
-                        if self.isTaskCancelled(taskId) {
-                            continuation.resume(throwing: ArchiveError.operationCancelled)
-                        } else if let archiveError = error as? ArchiveError {
-                            continuation.resume(throwing: archiveError)
-                        } else {
-                            continuation.resume(
-                                throwing: ArchiveError.unknownError(error.localizedDescription)
-                            )
-                        }
-                    }
-                    self.removeTask(taskId)
-                }
-            }
-        } onCancel: {
-            self.cancelTask(taskId)
-        }
     }
 
     /// 取消压缩任务
@@ -475,7 +501,7 @@ public class SwiftLibarchive {
     /// - Returns: 任务ID，可用于取消操作
     @discardableResult
     public func isPasswordRequiredAsync(archivePath: String, completion: @escaping (Result<Bool, ArchiveError>) -> Void) -> UUID {
-        let taskId = createTask()
+        let taskId = createTask(outputPath: nil, outputType: .none, createdDestination: false)
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else {
@@ -551,7 +577,7 @@ public class SwiftLibarchive {
     /// - Returns: 任务ID，可用于取消操作
     @discardableResult
     public func isSupportedArchiveAsync(filePath: String, completion: @escaping (Result<Bool, ArchiveError>) -> Void) -> UUID {
-        let taskId = createTask()
+        let taskId = createTask(outputPath: nil, outputType: .none, createdDestination: false)
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else {
@@ -617,6 +643,7 @@ fileprivate let ERROR_COMPRESS_FAILED: Int32 = -5
 fileprivate let ERROR_PASSWORD_REQUIRED: Int32 = -6
 fileprivate let ERROR_WRONG_PASSWORD: Int32 = -7
 fileprivate let ERROR_UNSUPPORTED_FORMAT: Int32 = -8
+fileprivate let ERROR_OPERATION_CANCELLED: Int32 = -9
 
 // 加密检测结果
 fileprivate let ENCRYPTION_NONE: Int32 = 0
@@ -633,7 +660,7 @@ fileprivate let ENCRYPTION_UNSUPPORTED: Int32 = -2
 ///   - password: 解压密码（如果需要）
 /// - Returns: 0表示成功，其他值表示错误代码
 @_silgen_name("extract_archive")
-fileprivate func extractArchive(_ archivePath: UnsafePointer<CChar>, _ destinationPath: UnsafePointer<CChar>, _ password: UnsafePointer<CChar>?) -> Int32
+fileprivate func extractArchive(_ archivePath: UnsafePointer<CChar>, _ destinationPath: UnsafePointer<CChar>, _ password: UnsafePointer<CChar>?, _ cancelFlag: UnsafeMutablePointer<Int32>?) -> Int32
 
 /// 压缩文件或目录的C函数
 /// - Parameters:
@@ -643,7 +670,7 @@ fileprivate func extractArchive(_ archivePath: UnsafePointer<CChar>, _ destinati
 ///   - password: 压缩密码（如果需要）
 /// - Returns: 0表示成功，其他值表示错误代码
 @_silgen_name("compress_files")
-fileprivate func compressFiles(_ sourcePath: UnsafePointer<CChar>, _ archivePath: UnsafePointer<CChar>, _ format: Int32, _ password: UnsafePointer<CChar>?) -> Int32
+fileprivate func compressFiles(_ sourcePath: UnsafePointer<CChar>, _ archivePath: UnsafePointer<CChar>, _ format: Int32, _ password: UnsafePointer<CChar>?, _ cancelFlag: UnsafeMutablePointer<Int32>?) -> Int32
 
 /// 检测压缩包是否需要密码的C函数
 /// - Parameter archivePath: 压缩包路径
