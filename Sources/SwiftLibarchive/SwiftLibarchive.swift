@@ -89,6 +89,7 @@ public class SwiftLibarchive {
         var outputPath: String?
         var outputType: TaskOutputType
         var createdDestination: Bool
+        var stagingPath: String?
     }
     
     /// 活动任务管理
@@ -99,7 +100,7 @@ public class SwiftLibarchive {
     private init() {}
     
     /// 创建新任务ID
-    private func createTask(outputPath: String?, outputType: TaskOutputType, createdDestination: Bool) -> UUID {
+    private func createTask(outputPath: String?, outputType: TaskOutputType, createdDestination: Bool, stagingPath: String? = nil) -> UUID {
         let taskId = UUID()
         let cancelFlag = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
         cancelFlag.initialize(to: 0)
@@ -110,7 +111,8 @@ public class SwiftLibarchive {
             cancelFlag: cancelFlag,
             outputPath: outputPath,
             outputType: outputType,
-            createdDestination: createdDestination
+            createdDestination: createdDestination,
+            stagingPath: stagingPath
         )
         taskLock.unlock()
         return taskId
@@ -177,6 +179,39 @@ public class SwiftLibarchive {
                 try? fm.removeItem(atPath: path)
             }
         }
+        
+        // 清理临时构建的 staging 目录
+        if let staging = state.stagingPath, fm.fileExists(atPath: staging) {
+            try? fm.removeItem(atPath: staging)
+        }
+    }
+    
+    /// 创建临时 staging 目录，将多个源以符号链接放入，便于统一压缩
+    private func makeStagingDirectory(for sources: [String]) throws -> String {
+        let fm = FileManager.default
+        let stagingURL = fm.temporaryDirectory.appendingPathComponent("swiftlibarchive-staging-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: stagingURL, withIntermediateDirectories: true, attributes: nil)
+        
+        var usedNames = Set<String>()
+        for (index, src) in sources.enumerated() {
+            let base = URL(fileURLWithPath: src).lastPathComponent.isEmpty ? "item\(index)" : URL(fileURLWithPath: src).lastPathComponent
+            var candidate = base
+            var counter = 1
+            while usedNames.contains(candidate) {
+                candidate = "\(base)-\(counter)"
+                counter += 1
+            }
+            usedNames.insert(candidate)
+            let dst = stagingURL.appendingPathComponent(candidate, isDirectory: false)
+            try fm.createSymbolicLink(at: dst, withDestinationURL: URL(fileURLWithPath: src))
+        }
+        return stagingURL.path
+    }
+    
+    /// 移除 staging 目录（忽略错误）
+    private func removeStagingDirectory(_ path: String?) {
+        guard let path, FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.removeItem(atPath: path)
     }
     
     /// 获取对应任务的取消标记指针
@@ -366,6 +401,33 @@ public class SwiftLibarchive {
         }
     }
     
+    /// 压缩多个文件或目录（同步方法）
+    public func compress(sources: [String], to archivePath: String, format: ArchiveFormat) throws {
+        guard !sources.isEmpty else {
+            throw ArchiveError.openFileFailed
+        }
+        if sources.count == 1, let first = sources.first {
+            try compress(sourcePath: first, to: archivePath, format: format)
+            return
+        }
+        
+        let staging: String
+        do {
+            staging = try makeStagingDirectory(for: sources)
+        } catch {
+            throw ArchiveError.unknownError("Failed to build staging: \(error.localizedDescription)")
+        }
+        
+        do {
+            try compress(sourcePath: staging, to: archivePath, format: format)
+        } catch {
+            removeStagingDirectory(staging)
+            throw error
+        }
+        
+        removeStagingDirectory(staging)
+    }
+    
     /// 异步压缩文件或目录
     /// - Parameters:
     ///   - sourcePath: 源文件或目录路径
@@ -458,6 +520,109 @@ public class SwiftLibarchive {
             }
             
             self.removeTask(taskId)
+        }
+        
+        return taskId
+    }
+    
+    /// 异步压缩多个文件或目录
+    @discardableResult
+    public func compress(sources: [String], to archivePath: String, format: ArchiveFormat, progress: ProgressCallback? = nil, completion: @escaping CompletionCallback) -> UUID {
+        guard !sources.isEmpty else {
+            completion(.failure(.openFileFailed))
+            return UUID()
+        }
+        if sources.count == 1, let first = sources.first {
+            return compress(sourcePath: first, to: archivePath, format: format, progress: progress, completion: completion)
+        }
+        
+        let staging: String
+        do {
+            staging = try makeStagingDirectory(for: sources)
+        } catch {
+            completion(.failure(.unknownError("Failed to build staging: \(error.localizedDescription)")))
+            return UUID()
+        }
+        
+        let taskId = createTask(outputPath: archivePath, outputType: .compress, createdDestination: true, stagingPath: staging)
+        let cancelFlag = cancelPointer(for: taskId)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                completion(.failure(.unknownError("Self is nil")))
+                return
+            }
+            
+            var currentProgress: Float = 0.0
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            timer.setEventHandler { [weak self] in
+                guard let self = self, !self.isTaskCancelled(taskId) else {
+                    timer.cancel()
+                    return
+                }
+                
+                // 增加进度，最大到0.95（留5%给最终处理）
+                if currentProgress < 0.95 {
+                    currentProgress += 0.05
+                    DispatchQueue.main.async {
+                        progress?(currentProgress)
+                    }
+                }
+            }
+            
+            timer.schedule(deadline: .now(), repeating: .milliseconds(200))
+            timer.resume()
+            
+            do {
+                // 检查任务是否已取消
+                if self.isTaskCancelled(taskId) {
+                    timer.cancel()
+                    DispatchQueue.main.async {
+                        completion(.failure(.operationCancelled))
+                    }
+                    self.cleanupOutputIfNeeded(taskId)
+                    self.removeTask(taskId)
+                    return
+                }
+                
+                // 执行压缩操作
+                try self.compress(sourcePath: staging, to: archivePath, format: format, cancelFlag: cancelFlag)
+                
+                // 检查任务是否已取消
+                if self.isTaskCancelled(taskId) {
+                    timer.cancel()
+                    DispatchQueue.main.async {
+                        completion(.failure(.operationCancelled))
+                    }
+                    self.cleanupOutputIfNeeded(taskId)
+                    self.removeTask(taskId)
+                    return
+                }
+                
+                // 完成进度
+                timer.cancel()
+                DispatchQueue.main.async {
+                    progress?(1.0)
+                    completion(.success(()))
+                }
+            } catch {
+                timer.cancel()
+                DispatchQueue.main.async {
+                    if self.isTaskCancelled(taskId) {
+                        completion(.failure(.operationCancelled))
+                        self.cleanupOutputIfNeeded(taskId)
+                    } else if let archiveError = error as? ArchiveError {
+                        if archiveError == .operationCancelled {
+                            self.cleanupOutputIfNeeded(taskId)
+                        }
+                        completion(.failure(archiveError))
+                    } else {
+                        completion(.failure(.unknownError(error.localizedDescription)))
+                    }
+                }
+            }
+            
+            self.removeTask(taskId)
+            self.removeStagingDirectory(staging)
         }
         
         return taskId
