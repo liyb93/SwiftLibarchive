@@ -89,12 +89,13 @@ struct ContentView: View {
 
 extension ContentView {
     func extract() {
-        guard let url = Bundle.main.path(forResource: "video", ofType: "zip") else { return }
+        let sourcePath = URL.temporaryDirectory.path + "/source.zip"
         let savePath = URL.temporaryDirectory.path
         print("---- savePath: \(savePath)")
         Task {
-            extractTask = SwiftLibarchive.shared.extract(archivePath: url, to: savePath, progress: { progress in
-                print("---- progress: \(progress)")
+            extractTask = SwiftLibarchive.shared.extract(archivePath: sourcePath, to: savePath, progress: { completed, total, seconds in
+                let progress = Float(completed) / Float(total)
+                print("---- progress: \(progress), seconds: \(seconds ?? 0)")
                 unzipProgress = progress
             }, completion: { result in
                 switch result {
@@ -118,8 +119,9 @@ extension ContentView {
         print("---- savePath: \(savePath)")
         Task {
             guard let source = await pickerFolder()?.first else { return }
-            compressTask = SwiftLibarchive.shared.compress(sourcePath: source.path, to: savePath, format: .zip(nil), progress: { progress in
-                print("---- progress: \(progress)")
+            compressTask = SwiftLibarchive.shared.compress(sourcePath: source.path, to: savePath, format: .zip(nil), progress: { completed, total, seconds in
+                let progress = Float(completed) / Float(total)
+                print("---- progress: \(progress), seconds: \(seconds ?? 0)")
                 zipProgress = progress
             }) { result in
                 switch result {
@@ -136,8 +138,9 @@ extension ContentView {
         let savePath = URL.temporaryDirectory.path + "/msource.zip"
         Task {
             guard let source = await pickerFolder(true) else { return }
-            compressTask = SwiftLibarchive.shared.compress(sources: source.compactMap({ $0.path }), to: savePath, format: .zip(nil), progress: { progress in
-                print("---- progress: \(progress)")
+            compressTask = SwiftLibarchive.shared.compress(sources: source.compactMap({ $0.path }), to: savePath, format: .zip(nil), progress: { completed, total, seconds in
+                let progress = Float(completed) / Float(total)
+                print("---- progress: \(progress), seconds: \(seconds ?? 0)")
                 zipProgress = progress
             }) { result in
                 switch result {

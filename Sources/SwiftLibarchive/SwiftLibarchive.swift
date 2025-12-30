@@ -54,8 +54,9 @@ public class SwiftLibarchive {
     }
     
     /// 进度回调类型
-    public typealias ProgressCallback = (Float) -> Void
-    
+    /// 进度回调：已完成字节、总字节、预估剩余秒（无法估计则为nil）
+    public typealias ProgressCallback = (_ completed: Int64, _ total: Int64, _ remainingSeconds: TimeInterval?) -> Void
+
     /// 完成回调类型
     public typealias CompletionCallback = (Result<Void, ArchiveError>) -> Void
     
@@ -214,6 +215,27 @@ public class SwiftLibarchive {
         try? FileManager.default.removeItem(atPath: path)
     }
     
+    /// 估算路径（文件/目录）的总字节数
+    private func estimateTotalSize(path: String) -> Int64 {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir) else { return 0 }
+        if !isDir.boolValue {
+            return (try? fm.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+        }
+        var total: Int64 = 0
+        if let enumerator = fm.enumerator(atPath: path) {
+            for case let item as String in enumerator {
+                let full = (path as NSString).appendingPathComponent(item)
+                var isD: ObjCBool = false
+                if fm.fileExists(atPath: full, isDirectory: &isD), !isD.boolValue {
+                    total += (try? fm.attributesOfItem(atPath: full)[.size] as? NSNumber)?.int64Value ?? 0
+                }
+            }
+        }
+        return total
+    }
+    
     /// 获取对应任务的取消标记指针
     private func cancelPointer(for taskId: UUID) -> UnsafeMutablePointer<Int32>? {
         taskLock.lock()
@@ -273,6 +295,8 @@ public class SwiftLibarchive {
             
             // 模拟进度更新
             var currentProgress: Float = 0.0
+            let totalBytes: Int64 = (try? FileManager.default.attributesOfItem(atPath: archivePath)[.size] as? NSNumber)?.int64Value ?? 0
+            let startTime = Date()
             let progressTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
             
             progressTimer.setEventHandler { [weak self] in
@@ -284,8 +308,11 @@ public class SwiftLibarchive {
                 // 增加进度，最大到0.95（留5%给最终处理）
                 if currentProgress < 0.95 {
                     currentProgress += 0.05
+                    let completed = Int64(Double(totalBytes) * Double(currentProgress))
+                    let elapsed = Date().timeIntervalSince(startTime)
+                    let eta: TimeInterval? = currentProgress > 0 ? elapsed * Double(1 - currentProgress) / Double(currentProgress) : nil
                     DispatchQueue.main.async {
-                        progress?(currentProgress)
+                        progress?(completed, totalBytes, eta)
                     }
                 }
             }
@@ -322,7 +349,7 @@ public class SwiftLibarchive {
                 // 完成进度
                 progressTimer.cancel()
                 DispatchQueue.main.async {
-                    progress?(1.0)
+                    progress?(totalBytes, totalBytes, 0)
                     completion(.success(()))
                 }
             } catch {
@@ -448,8 +475,11 @@ public class SwiftLibarchive {
                 return
             }
             
-            // 模拟进度更新
+            // 模拟进度更新（按归档文件大小粗估）
             var currentProgress: Float = 0.0
+            let totalBytes: Int64 = (try? FileManager.default.attributesOfItem(atPath: sourcePath)[.size] as? NSNumber)?.int64Value
+                ?? Int64(estimateTotalSize(path: sourcePath))
+            let startTime = Date()
             let progressTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
             
             progressTimer.setEventHandler { [weak self] in
@@ -461,8 +491,11 @@ public class SwiftLibarchive {
                 // 增加进度，最大到0.95（留5%给最终处理）
                 if currentProgress < 0.95 {
                     currentProgress += 0.05
+                    let completed = Int64(Double(totalBytes) * Double(currentProgress))
+                    let elapsed = Date().timeIntervalSince(startTime)
+                    let eta: TimeInterval? = currentProgress > 0 ? elapsed * Double(1 - currentProgress) / Double(currentProgress) : nil
                     DispatchQueue.main.async {
-                        progress?(currentProgress)
+                        progress?(completed, totalBytes, eta)
                     }
                 }
             }
@@ -499,7 +532,7 @@ public class SwiftLibarchive {
                 // 完成进度
                 progressTimer.cancel()
                 DispatchQueue.main.async {
-                    progress?(1.0)
+                progress?(totalBytes, totalBytes, 0)
                     completion(.success(()))
                 }
             } catch {
@@ -553,6 +586,8 @@ public class SwiftLibarchive {
             }
             
             var currentProgress: Float = 0.0
+            let totalBytes: Int64 = sources.reduce(0) { $0 + self.estimateTotalSize(path: $1) }
+            let startTime = Date()
             let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
             timer.setEventHandler { [weak self] in
                 guard let self = self, !self.isTaskCancelled(taskId) else {
@@ -563,8 +598,11 @@ public class SwiftLibarchive {
                 // 增加进度，最大到0.95（留5%给最终处理）
                 if currentProgress < 0.95 {
                     currentProgress += 0.05
+                    let completed = Int64(Double(totalBytes) * Double(currentProgress))
+                    let elapsed = Date().timeIntervalSince(startTime)
+                    let eta: TimeInterval? = currentProgress > 0 ? elapsed * Double(1 - currentProgress) / Double(currentProgress) : nil
                     DispatchQueue.main.async {
-                        progress?(currentProgress)
+                        progress?(completed, totalBytes, eta)
                     }
                 }
             }
@@ -601,7 +639,7 @@ public class SwiftLibarchive {
                 // 完成进度
                 timer.cancel()
                 DispatchQueue.main.async {
-                    progress?(1.0)
+                    progress?(totalBytes, totalBytes, 0)
                     completion(.success(()))
                 }
             } catch {
