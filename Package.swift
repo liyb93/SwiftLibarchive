@@ -178,7 +178,7 @@ let package = Package(
             dependencies: ["CLibarchive"],
             linkerSettings: [
                 .linkedLibrary("bz2"),
-                .linkedLibrary("xml2"),
+                .linkedLibrary("expat"),
                 .linkedLibrary("iconv")
             ]
         ),
