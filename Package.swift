@@ -14,11 +14,8 @@ let package = Package(
             name: "SwiftLibarchive",
             targets: ["SwiftLibarchive"]),
     ],
-    dependencies: [
-        // 依赖项，如果需要的话
-    ],
+    dependencies: [],
     targets: [
-        // 内置libarchive库
         .target(
             name: "CLibarchiveCore",
             path: "Sources/libarchive_src/libarchive",
@@ -166,10 +163,9 @@ let package = Package(
                 .define("LIBARCHIVE_STATIC"),
                 .define("PLATFORM_DARWIN"),
                 .define("ARCHIVE_ACL_DARWIN", to: "1"),
-                .unsafeFlags(["-w"])  // 忽略所有警告（不推荐）
+                .unsafeFlags(["-w"])
             ]
         ),
-        // C语言包装库target
         .target(
             name: "CLibarchive",
             dependencies: ["CLibarchiveCore"],
@@ -177,10 +173,14 @@ let package = Package(
             sources: ["libarchive_wrapper.c"],
             publicHeadersPath: "include"
         ),
-        // Swift库target
         .target(
             name: "SwiftLibarchive",
-            dependencies: ["CLibarchive"]
+            dependencies: ["CLibarchive"],
+            linkerSettings: [
+                .linkedLibrary("bz2"),
+                .linkedLibrary("xml2"),
+                .linkedLibrary("iconv")
+            ]
         ),
     ]
 )
